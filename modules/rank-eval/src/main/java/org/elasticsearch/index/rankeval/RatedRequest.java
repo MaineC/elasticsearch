@@ -32,8 +32,14 @@ import org.elasticsearch.search.builder.SearchSourceBuilder;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+
+import java.util.Map;
+import java.util.Map.Entry;
 
 /**
  * Defines a QA specification: All end user supplied query intents will be mapped to the search request specified in this search request
@@ -41,8 +47,8 @@ import java.util.Objects;
  *
  * The resulting document lists can then be compared against what was specified in the set of rated documents as part of a QAQuery.
  * */
+@SuppressWarnings("unchecked")
 public class RatedRequest extends ToXContentToBytes implements Writeable {
-
     private String specId;
     private SearchSourceBuilder testRequest;
     private List<String> indices = new ArrayList<>();
@@ -50,6 +56,8 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
     private List<String> summaryFields = new ArrayList<>();
     /** Collection of rated queries for this query QA specification.*/
     private List<RatedDocument> ratedDocs = new ArrayList<>();
+    /** Map of parameters to use for filling a query template, can be used instead of providing testRequest. */
+    private Map<String, String> params = new HashMap<>();
 
     public RatedRequest() {
         // ctor that doesn't require all args to be present immediatly is easier to use with ObjectParser
@@ -62,7 +70,7 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
         this.testRequest = testRequest;
         this.indices = indices;
         this.types = types;
-        this.ratedDocs = ratedDocs;
+        setRatedDocs(ratedDocs);
     }
 
     public RatedRequest(StreamInput in) throws IOException {
@@ -83,6 +91,7 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
         for (int i = 0; i < intentSize; i++) {
             ratedDocs.add(new RatedDocument(in));
         }
+        this.params = (Map) in.readMap();
         int summaryFieldsSize = in.readInt();
         summaryFields = new ArrayList<>(summaryFieldsSize);
         for (int i = 0; i < summaryFieldsSize; i++) {
@@ -106,6 +115,7 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
         for (RatedDocument ratedDoc : ratedDocs) {
             ratedDoc.writeTo(out);
         }
+        out.writeMap((Map) params);
         out.writeInt(summaryFields.size());
         for (String fieldName : summaryFields) {
             out.writeString(fieldName);
@@ -151,9 +161,28 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
         return ratedDocs;
     }
 
-    /** Set a list of rated documents for this query. */
+    /**
+     * Set a list of rated documents for this query.
+     * No documents with same _index/_type/id allowed.
+     **/
     public void setRatedDocs(List<RatedDocument> ratedDocs) {
+        Set<DocumentKey> docKeys = new HashSet<>();
+        for (RatedDocument doc : ratedDocs) {
+            if (docKeys.add(doc.getKey()) == false) {
+                String docKeyToString = doc.getKey().toString().replaceAll("\n", "").replaceAll("  ", " ");
+                throw new IllegalArgumentException(
+                        "Found duplicate rated document key [" + docKeyToString + "]");
+            }
+        }
         this.ratedDocs = ratedDocs;
+    }
+    
+    public void setParams(Map<String, String> params) {
+        this.params = params;
+    }
+    
+    public Map<String, String> getParams() {
+        return this.params;
     }
 
     public void setSummaryFields(List<String> fields) {
@@ -168,6 +197,7 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
     private static final ParseField ID_FIELD = new ParseField("id");
     private static final ParseField REQUEST_FIELD = new ParseField("request");
     private static final ParseField RATINGS_FIELD = new ParseField("ratings");
+    private static final ParseField PARAMS_FIELD = new ParseField("params");
     private static final ParseField FIELDS_FIELD = new ParseField("summary_fields");
     private static final ObjectParser<RatedRequest, RankEvalContext> PARSER = new ObjectParser<>("requests", RatedRequest::new);
 
@@ -187,7 +217,14 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
             } catch (IOException ex) {
                 throw new ParsingException(p.getTokenLocation(), "error parsing ratings", ex);
             }
-        } , RATINGS_FIELD);
+        }, RATINGS_FIELD);
+        PARSER.declareObject(RatedRequest::setParams, (p, c) -> {
+            try {
+                return (Map) p.map();
+            } catch (IOException ex) {
+                throw new ParsingException(p.getTokenLocation(), "error parsing ratings", ex);
+            }
+        }, PARAMS_FIELD);
     }
 
     /**
@@ -219,7 +256,13 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         builder.startObject();
         builder.field(ID_FIELD.getPreferredName(), this.specId);
-        builder.field(REQUEST_FIELD.getPreferredName(), this.testRequest);
+        if (testRequest != null)
+            builder.field(REQUEST_FIELD.getPreferredName(), this.testRequest);
+        builder.startObject(PARAMS_FIELD.getPreferredName());
+        for (Entry<String, String> entry : this.params.entrySet()) {
+            builder.field(entry.getKey(), entry.getValue());
+        }
+        builder.endObject();
         builder.startArray(RATINGS_FIELD.getPreferredName());
         for (RatedDocument doc : this.ratedDocs) {
             doc.toXContent(builder, params);
@@ -250,11 +293,12 @@ public class RatedRequest extends ToXContentToBytes implements Writeable {
                 Objects.equals(indices, other.indices) &&
                 Objects.equals(types, other.types) &&
                 Objects.equals(summaryFields, summaryFields) &&
-                Objects.equals(ratedDocs, other.ratedDocs);
+                Objects.equals(ratedDocs, other.ratedDocs) &&
+                Objects.equals(params, other.params);
     }
 
     @Override
     public final int hashCode() {
-        return Objects.hash(specId, testRequest, indices, types, summaryFields, ratedDocs);
+        return Objects.hash(specId, testRequest, indices, types, summaryFields, ratedDocs, params);
     }
 }
